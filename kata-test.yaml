@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-test
+spec:
+  runtimeClassName: kata-vm-isolation
+  containers:
+    - name: kata-test
+      image: mcr.microsoft.com/aks/fundamental/base-ubuntu:v0.0.11
+      command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
