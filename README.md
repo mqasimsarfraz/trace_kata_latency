@@ -67,9 +67,38 @@ FAILED   OPERATION       LATENCY_NS      SANDBOX_ID
 0        SANDBOX_REMOVE  42.76ms         9c58a84...
 ```
 
-This measures kubelet CRI RPC duration. `SANDBOX_RUN` captures the
-runtime-visible Kata VM startup path, but not later image pulls,
-`CreateContainer`, `StartContainer`, scheduling, or application readiness.
+## Interpreting the output
+
+- `FAILED` is `0` when the CRI call succeeds and `1` when it returns an error.
+- `OPERATION` identifies the CRI sandbox lifecycle call.
+- `LATENCY_NS` is the request-to-response duration, rendered in a
+  human-readable unit by `ig`.
+- `SANDBOX_ID` is the ID returned by a successful `RunPodSandbox` call or
+  supplied to a later stop or remove call.
+
+A failed `SANDBOX_RUN` normally has an empty `SANDBOX_ID` because the runtime
+did not return a usable sandbox. Repeated failed runs commonly indicate that
+kubelet is retrying sandbox creation for the same Pod. The gadget records only
+whether the call failed, not the error message; use `kubectl describe pod`,
+Kubernetes events, and kubelet or containerd logs to find the cause.
+
+## `RunPodSandbox` semantics and latency boundary
+
+The CRI defines `RunPodSandbox` as a unary gRPC request and requires the
+runtime to leave the sandbox in the ready state when the call succeeds.
+Kubelet calls it directly and waits for either a sandbox ID or an error, so
+each individual call is synchronous from kubelet's perspective. Kubelet can
+still issue multiple calls concurrently for different Pods.
+
+For Kata Containers, this duration captures the runtime-visible sandbox path,
+which typically includes starting the Kata runtime shim, hypervisor, guest VM,
+and guest agent. The exact work depends on the Kata, containerd, and platform
+configuration.
+
+The measurement does not include work performed after `RunPodSandbox`
+returns, such as image pulls, `CreateContainer`, `StartContainer`, or
+application readiness. It also does not include scheduler queueing before
+kubelet starts the CRI request.
 
 The gadget classifies successful `RunPodSandbox` calls by their `kata` runtime
 handler (selected by the `kata-vm-isolation` RuntimeClass) and remembers the
@@ -77,3 +106,21 @@ returned sandbox ID.
 Later stop and remove calls are emitted only when their ID belongs to a
 remembered Kata sandbox. Sandboxes created before the gadget starts are not
 known, so their stop and remove calls are not emitted.
+
+## Runtime warnings
+
+`run-aks.sh` passes `--verify-image=false`, so `ig` warns that gadget signature
+verification is disabled. This permits unsigned gadget images but removes the
+image authenticity check.
+
+`ig` also warns when the gadget build version differs from the running `ig`
+version. The gadget may work, but matching versions is recommended because
+metadata, event schemas, and runtime APIs can change between releases.
+
+## References
+
+- [Kubernetes CRI `RuntimeService` definition](https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto)
+- [Kubelet `createPodSandbox` implementation](https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/kuberuntime_sandbox.go)
+- [gRPC core concepts and unary RPC lifecycle](https://grpc.io/docs/what-is-grpc/core-concepts/)
+- [Kata Containers architecture](https://github.com/kata-containers/kata-containers/blob/main/docs/design/architecture/README.md)
+- [Kata Containers and Kubernetes](https://github.com/kata-containers/kata-containers/blob/main/docs/design/architecture/kubernetes.md)
