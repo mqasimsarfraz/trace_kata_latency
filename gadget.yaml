@@ -15,6 +15,9 @@ datasources:
         annotations:
           columns.hidden: "true"
           json.skip: "true"
+      proc.comm:
+        annotations:
+          columns.hidden: "true"
       proc.pid:
         annotations:
           columns.hidden: "true"
@@ -40,3 +43,7 @@ datasources:
         annotations:
           description: Whether the CRI call completed with an error
           columns.width: 8
+      sandbox_id:
+        annotations:
+          description: CRI pod sandbox ID
+          columns.width: 32

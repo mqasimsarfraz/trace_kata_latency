@@ -16,8 +16,11 @@
 #define RUN_POD_SANDBOX_METHOD "/runtime.v1.RuntimeService/RunPodSandbox"
 #define STOP_POD_SANDBOX_METHOD "/runtime.v1.RuntimeService/StopPodSandbox"
 #define REMOVE_POD_SANDBOX_METHOD "/runtime.v1.RuntimeService/RemovePodSandbox"
+#define KATA_RUNTIME_HANDLER "kata"
 #define MAX_CRI_METHOD_LEN (sizeof(REMOVE_POD_SANDBOX_METHOD) - 1)
+#define MAX_SANDBOX_ID_LEN 128
 #define MAX_INFLIGHT_RPCS 1024
+#define MAX_KATA_SANDBOXES 4096
 
 enum gadget_sandbox_operation {
 	SANDBOX_RUN,
@@ -31,11 +34,40 @@ struct event {
 	gadget_duration latency_ns_raw;
 	enum gadget_sandbox_operation operation_raw;
 	__u8 failed;
+	char sandbox_id[MAX_SANDBOX_ID_LEN];
+};
+
+struct gadget_go_string {
+	const char *data;
+	__u64 len;
+};
+
+// Kubernetes 1.35 generated messages keep one pointer-sized state field first.
+struct gadget_run_pod_sandbox_request {
+	__u64 state;
+	const void *config;
+	struct gadget_go_string runtime_handler;
+};
+
+struct gadget_sandbox_id_message {
+	__u64 state;
+	struct gadget_go_string sandbox_id;
+};
+
+struct gadget_sandbox_id {
+	char value[MAX_SANDBOX_ID_LEN];
 };
 
 struct gadget_rpc_state {
 	__u64 start_ns;
 	enum gadget_sandbox_operation operation;
+	const void *reply;
+	struct gadget_sandbox_id sandbox_id;
+};
+
+struct gadget_rpc_scratch {
+	struct gadget_rpc_state state;
+	struct gadget_sandbox_id sandbox_id;
 };
 
 GADGET_TRACER_MAP(events, 1024 * 64);
@@ -49,6 +81,21 @@ struct {
 	__type(value, struct gadget_rpc_state);
 } gadget_inflight_rpcs SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	// 4096 entries use about 512 KiB and cover the Kata sandboxes on one node.
+	__uint(max_entries, MAX_KATA_SANDBOXES);
+	__type(key, struct gadget_sandbox_id);
+	__type(value, __u8);
+} gadget_kata_sandboxes SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct gadget_rpc_scratch);
+} gadget_rpc_scratch SEC(".maps");
+
 static __always_inline int gadget_get_sandbox_operation(const char *method_ptr,
 							 __u64 method_len)
 {
@@ -57,8 +104,12 @@ static __always_inline int gadget_get_sandbox_operation(const char *method_ptr,
 	if (method_len > sizeof(method))
 		return -1;
 
-	if (bpf_probe_read_user(method, method_len, method_ptr))
-		return -1;
+	for (__u32 i = 0; i < MAX_CRI_METHOD_LEN; i++) {
+		if (i >= method_len)
+			break;
+		if (bpf_probe_read_user(&method[i], 1, method_ptr + i))
+			return -1;
+	}
 
 	if (method_len == sizeof(RUN_POD_SANDBOX_METHOD) - 1 &&
 	    __builtin_memcmp(method, RUN_POD_SANDBOX_METHOD,
@@ -78,27 +129,106 @@ static __always_inline int gadget_get_sandbox_operation(const char *method_ptr,
 	return -1;
 }
 
-// newClientStream receives the full gRPC method before a unary request starts.
-SEC("uprobe//opt/bin/kubelet:google.golang.org/grpc.newClientStream")
+static __always_inline int
+gadget_read_go_string(struct gadget_sandbox_id *dst,
+		      const struct gadget_go_string *src)
+{
+	__builtin_memset(dst, 0, sizeof(*dst));
+
+	if (!src->data || !src->len || src->len >= sizeof(dst->value))
+		return -1;
+
+	for (__u32 i = 0; i < MAX_SANDBOX_ID_LEN; i++) {
+		if (i >= src->len)
+			break;
+		if (bpf_probe_read_user(&dst->value[i], 1, src->data + i))
+			return -1;
+	}
+
+	return 0;
+}
+
+static __always_inline int
+gadget_is_kata_run_request(const void *request_ptr)
+{
+	struct gadget_run_pod_sandbox_request request = {};
+	char runtime_handler[sizeof(KATA_RUNTIME_HANDLER)] = {};
+
+	if (bpf_probe_read_user(&request, sizeof(request), request_ptr))
+		return 0;
+
+	if (request.runtime_handler.len != sizeof(KATA_RUNTIME_HANDLER) - 1)
+		return 0;
+
+	if (bpf_probe_read_user(runtime_handler,
+				sizeof(KATA_RUNTIME_HANDLER) - 1,
+				request.runtime_handler.data))
+		return 0;
+
+	return __builtin_memcmp(runtime_handler, KATA_RUNTIME_HANDLER,
+				sizeof(KATA_RUNTIME_HANDLER) - 1) == 0;
+}
+
+static __always_inline int
+gadget_read_sandbox_id_message(struct gadget_sandbox_id *sandbox_id,
+			       const void *message_ptr)
+{
+	struct gadget_sandbox_id_message message = {};
+
+	if (bpf_probe_read_user(&message, sizeof(message), message_ptr))
+		return -1;
+
+	return gadget_read_go_string(sandbox_id, &message.sandbox_id);
+}
+
+// Invoke exposes the request and response pointers before the unary RPC starts.
+SEC("uprobe//opt/bin/kubelet:google.golang.org/grpc.(*ClientConn).Invoke")
 int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 {
-	const char *method_ptr = (const char *)GO_PARAM5(ctx);
-	__u64 method_len = (__u64)GO_PARAM6(ctx);
+	const char *method_ptr = (const char *)GO_PARAM4(ctx);
+	__u64 method_len = (__u64)GO_PARAM5(ctx);
+	const void *request_ptr = GO_PARAM7(ctx);
 	int operation = gadget_get_sandbox_operation(method_ptr, method_len);
-	struct gadget_rpc_state state = {};
+	struct gadget_rpc_scratch *scratch;
+	struct gadget_rpc_state *state;
+	__u8 *known_sandbox;
+	__u32 zero = 0;
 	__u64 goroutine;
 
 	if (operation < 0)
 		return 0;
 
-	goroutine = (__u64)GOROUTINE_PTR(ctx);
-	state.start_ns = bpf_ktime_get_boot_ns();
-	state.operation = operation;
-
-	// If the map is full, skip the RPC rather than emitting an uncorrelated result.
-	if (bpf_map_update_elem(&gadget_inflight_rpcs, &goroutine, &state,
-				BPF_ANY))
+	scratch = bpf_map_lookup_elem(&gadget_rpc_scratch, &zero);
+	if (!scratch)
 		return 0;
+
+	state = &scratch->state;
+	__builtin_memset(state, 0, sizeof(*state));
+
+	if (operation == SANDBOX_RUN) {
+		if (!gadget_is_kata_run_request(request_ptr))
+			return 0;
+		state->reply = GO_PARAM9(ctx);
+	} else {
+		if (gadget_read_sandbox_id_message(&state->sandbox_id,
+						   request_ptr))
+			return 0;
+
+		known_sandbox = bpf_map_lookup_elem(&gadget_kata_sandboxes,
+						    &state->sandbox_id);
+		if (!known_sandbox)
+			return 0;
+	}
+
+	goroutine = (__u64)GOROUTINE_PTR(ctx);
+	state->start_ns = bpf_ktime_get_boot_ns();
+	state->operation = operation;
+
+	if (bpf_map_update_elem(&gadget_inflight_rpcs, &goroutine, state,
+				BPF_ANY)) {
+		bpf_printk("kata latency: inflight RPC map is full");
+		return 0;
+	}
 
 	return 0;
 }
@@ -110,14 +240,43 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 {
 	__u64 goroutine = (__u64)GOROUTINE_PTR(ctx);
 	struct gadget_rpc_state *state;
+	struct gadget_rpc_scratch *scratch;
+	struct gadget_sandbox_id *sandbox_id;
 	struct event *event;
+	__u8 kata_sandbox = 1;
+	__u32 zero = 0;
+	bool failed;
 	__u64 now;
 
 	state = bpf_map_lookup_elem(&gadget_inflight_rpcs, &goroutine);
 	if (!state)
 		return 0;
 
+	scratch = bpf_map_lookup_elem(&gadget_rpc_scratch, &zero);
+	if (!scratch)
+		goto cleanup;
+
+	sandbox_id = &scratch->sandbox_id;
+	__builtin_memset(sandbox_id, 0, sizeof(*sandbox_id));
+
 	now = bpf_ktime_get_boot_ns();
+	failed = (__u64)GO_PARAM2(ctx) != 0;
+
+	if (state->operation == SANDBOX_RUN && !failed) {
+		if (gadget_read_sandbox_id_message(sandbox_id, state->reply))
+			goto cleanup;
+
+		if (bpf_map_update_elem(&gadget_kata_sandboxes, sandbox_id,
+					&kata_sandbox, BPF_ANY))
+			bpf_printk("kata latency: sandbox map is full");
+	} else {
+		__builtin_memcpy(sandbox_id, &state->sandbox_id,
+				 sizeof(*sandbox_id));
+	}
+
+	if (state->operation == SANDBOX_REMOVE && !failed)
+		bpf_map_delete_elem(&gadget_kata_sandboxes, sandbox_id);
+
 	event = gadget_reserve_buf(&events, sizeof(*event));
 	if (!event)
 		goto cleanup;
@@ -127,7 +286,9 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	gadget_process_populate(&event->proc);
 	event->latency_ns_raw = now - state->start_ns;
 	event->operation_raw = state->operation;
-	event->failed = (__u64)GO_PARAM2(ctx) != 0;
+	event->failed = failed;
+	__builtin_memcpy(event->sandbox_id, sandbox_id->value,
+			 sizeof(event->sandbox_id));
 
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 

@@ -7,9 +7,10 @@ request-to-response latency at the kubelet CRI boundary.
 
 The gadget traces:
 
-- `RunPodSandbox`, which includes creation and startup of the Kata VM.
-- `StopPodSandbox`, which stops the sandbox and its VM.
-- `RemovePodSandbox`, which removes the sandbox resources.
+- Kata `RunPodSandbox` requests using the `kata` runtime handler,
+  including creation and startup of the Kata VM.
+- `StopPodSandbox` for Kata sandbox IDs observed by the gadget.
+- `RemovePodSandbox` for Kata sandbox IDs observed by the gadget.
 
 ## Requirements
 
@@ -60,16 +61,19 @@ It uses:
 Example output:
 
 ```text
-OPERATION              LATENCY_NS   FAILED
-SANDBOX_RUN            1.21s        0
-SANDBOX_STOP           184.32ms     0
-SANDBOX_REMOVE         42.76ms      0
+FAILED   OPERATION       LATENCY_NS      SANDBOX_ID
+0        SANDBOX_RUN     1.314252181s    9c58a84...
+0        SANDBOX_STOP    149.73ms        9c58a84...
+0        SANDBOX_REMOVE  42.76ms         9c58a84...
 ```
 
 This measures kubelet CRI RPC duration. `SANDBOX_RUN` captures the
 runtime-visible Kata VM startup path, but not later image pulls,
 `CreateContainer`, `StartContainer`, scheduling, or application readiness.
 
-The CRI method names do not identify the selected runtime. Run the gadget on
-nodes or workloads configured to use the Kata `RuntimeClass` so the sandbox
-events correspond to Kata Containers.
+The gadget classifies successful `RunPodSandbox` calls by their `kata` runtime
+handler (selected by the `kata-vm-isolation` RuntimeClass) and remembers the
+returned sandbox ID.
+Later stop and remove calls are emitted only when their ID belongs to a
+remembered Kata sandbox. Sandboxes created before the gadget starts are not
+known, so their stop and remove calls are not emitted.
