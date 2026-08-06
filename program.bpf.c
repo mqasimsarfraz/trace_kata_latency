@@ -48,8 +48,8 @@ struct event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_process proc;
 	gadget_duration latency_ns_raw;
-	enum gadget_cri_operation operation_raw;
-	__u8 failed;
+	bool failed;
+	char operation[20];
 	char runtime_handler[sizeof(KATA_PREVIEW_RUNTIME_HANDLER)];
 	char sandbox_id[MAX_SANDBOX_ID_LEN];
 	char container_id[MAX_CONTAINER_ID_LEN];
@@ -266,6 +266,34 @@ gadget_read_create_container_request(struct gadget_cri_id *sandbox_id,
 }
 
 static __always_inline void
+gadget_set_operation(char dst[20], enum gadget_cri_operation operation)
+{
+	switch (operation) {
+	case SANDBOX_RUN:
+		__builtin_memcpy(dst, "RunPodSandbox", sizeof("RunPodSandbox"));
+		break;
+	case SANDBOX_STOP:
+		__builtin_memcpy(dst, "StopPodSandbox", sizeof("StopPodSandbox"));
+		break;
+	case SANDBOX_REMOVE:
+		__builtin_memcpy(dst, "RemovePodSandbox", sizeof("RemovePodSandbox"));
+		break;
+	case CONTAINER_CREATE:
+		__builtin_memcpy(dst, "CreateContainer", sizeof("CreateContainer"));
+		break;
+	case CONTAINER_START:
+		__builtin_memcpy(dst, "StartContainer", sizeof("StartContainer"));
+		break;
+	case CONTAINER_STOP:
+		__builtin_memcpy(dst, "StopContainer", sizeof("StopContainer"));
+		break;
+	case CONTAINER_REMOVE:
+		__builtin_memcpy(dst, "RemoveContainer", sizeof("RemoveContainer"));
+		break;
+	}
+}
+
+static __always_inline void
 gadget_set_runtime_handler(char *runtime_handler,
 			   enum gadget_kata_handler handler)
 {
@@ -421,8 +449,8 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	event->timestamp_raw = now;
 	gadget_process_populate(&event->proc);
 	event->latency_ns_raw = now - state->start_ns;
-	event->operation_raw = state->operation;
 	event->failed = failed;
+	gadget_set_operation(event->operation, state->operation);
 	gadget_set_runtime_handler(event->runtime_handler, state->handler);
 	__builtin_memcpy(event->sandbox_id, state->sandbox_id.value,
 			 sizeof(event->sandbox_id));

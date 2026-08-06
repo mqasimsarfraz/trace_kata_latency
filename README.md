@@ -148,3 +148,29 @@ metadata, event schemas, and runtime APIs can change between releases.
 - [gRPC core concepts and unary RPC lifecycle](https://grpc.io/docs/what-is-grpc/core-concepts/)
 - [Kata Containers architecture](https://github.com/kata-containers/kata-containers/blob/main/docs/design/architecture/README.md)
 - [Kata Containers and Kubernetes](https://github.com/kata-containers/kata-containers/blob/main/docs/design/architecture/kubernetes.md)
+
+## Stable JSON output contract
+
+For analysis, request these public fields explicitly:
+
+```bash
+ig run "$GADGET_IMAGE" --output json \
+  --fields timestamp,runtime_handler,operation,latency_ns_raw,failed,sandbox_id,container_id
+```
+
+`operation` is an explicit stable CRI method name and `failed` is a JSON boolean and `latency_ns_raw` is nanoseconds. Later container events retain both their container ID and parent sandbox ID. Validate a capture with `./validate-output.py capture.jsonl`; the default extended profile requires successful Run/Create/Start/Stop/Remove operations and an intentional failure for each handler. Use `--profile core` only when teardown is outside the capture window. Zero events fail validation.
+
+The `kata` and `kata-preview` strings are CRI handler names. Record RuntimeClass mappings and runtime configurations before interpreting results; two names may alias the same Kata implementation.
+
+### Validator lifecycle policy
+
+The validator processes events in timestamp and file order. Successful calls
+must follow the normal CRI sequence `RunPodSandbox` → `CreateContainer` →
+`StartContainer` → `StopContainer` → `RemoveContainer` → `StopPodSandbox` →
+`RemovePodSandbox`. Sandbox teardown is rejected while a traced child remains.
+Failed calls are permitted only when their referenced object is in the state
+required by that operation; a failed call never advances or removes state, so
+a later retry is validated against the same prerequisite. A failed
+`RunPodSandbox` may have no returned sandbox ID because no identity was learned.
+The validator intentionally does not infer objects created before tracing
+started. Such partial streams fail and must be recaptured from sandbox creation.

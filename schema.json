@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "trace_kata_latency event",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["timestamp", "runtime_handler", "operation", "latency_ns_raw", "failed", "sandbox_id", "container_id"],
+  "properties": {
+    "timestamp": {"type": "string", "format": "date-time"},
+    "runtime_handler": {"enum": ["kata", "kata-preview"]},
+    "operation": {"enum": ["RunPodSandbox", "StopPodSandbox", "RemovePodSandbox", "CreateContainer", "StartContainer", "StopContainer", "RemoveContainer"]},
+    "latency_ns_raw": {"type": "integer", "minimum": 0},
+    "failed": {"type": "boolean"},
+    "sandbox_id": {"type": "string", "maxLength": 127},
+    "container_id": {"type": "string", "maxLength": 127}
+  }
+}
