@@ -81,6 +81,11 @@ struct gadget_cri_id {
 	char value[MAX_CONTAINER_ID_LEN];
 };
 
+struct gadget_container_state {
+	struct gadget_cri_id sandbox_id;
+	enum gadget_kata_handler handler;
+};
+
 struct gadget_rpc_state {
 	__u64 start_ns;
 	enum gadget_cri_operation operation;
@@ -116,10 +121,10 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	// 8192 entries use about 1 MiB and cover active Kata containers on one node.
+	// 8192 entries use about 2 MiB and cover active Kata containers on one node.
 	__uint(max_entries, MAX_KATA_CONTAINERS);
 	__type(key, struct gadget_cri_id);
-	__type(value, __u8);
+	__type(value, struct gadget_container_state);
 } gadget_kata_containers SEC(".maps");
 
 struct {
@@ -283,6 +288,7 @@ int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 	struct gadget_rpc_scratch *scratch;
 	struct gadget_rpc_state *state;
 	__u8 *known_handler;
+	struct gadget_container_state *known_container;
 	__u32 zero = 0;
 	__u64 goroutine;
 	int handler;
@@ -328,11 +334,13 @@ int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 		if (gadget_read_id_message(&state->container_id, request_ptr))
 			return 0;
 
-		known_handler = bpf_map_lookup_elem(&gadget_kata_containers,
-						    &state->container_id);
-		if (!known_handler)
+		known_container = bpf_map_lookup_elem(&gadget_kata_containers,
+						      &state->container_id);
+		if (!known_container)
 			return 0;
-		state->handler = *known_handler;
+		state->handler = known_container->handler;
+		__builtin_memcpy(&state->sandbox_id, &known_container->sandbox_id,
+				 sizeof(state->sandbox_id));
 	}
 
 	goroutine = (__u64)GOROUTINE_PTR(ctx);
@@ -359,6 +367,7 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	struct gadget_cri_id *response_id;
 	struct event *event;
 	__u8 handler;
+	struct gadget_container_state container_state = {};
 	__u32 zero = 0;
 	bool failed;
 	__u64 now;
@@ -389,8 +398,11 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 		if (gadget_read_id_message(response_id, state->reply))
 			goto cleanup;
 
+		__builtin_memcpy(&container_state.sandbox_id, &state->sandbox_id,
+				 sizeof(container_state.sandbox_id));
+		container_state.handler = handler;
 		if (bpf_map_update_elem(&gadget_kata_containers, response_id,
-					&handler, BPF_ANY))
+					&container_state, BPF_ANY))
 			bpf_printk("kata latency: container map is full");
 	}
 
