@@ -23,13 +23,13 @@ class ValidatorTests(unittest.TestCase):
             if line.strip()
         ]
 
-    def validate(self, rows):
+    def validate(self, rows, profile="extended"):
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", encoding="utf-8") as stream:
             for row in rows:
                 stream.write(json.dumps(row) + "\n")
             stream.flush()
             return subprocess.run(
-                [sys.executable, str(VALIDATOR), stream.name],
+                [sys.executable, str(VALIDATOR), stream.name, "--profile", profile],
                 text=True,
                 capture_output=True,
                 check=False,
@@ -71,10 +71,34 @@ class ValidatorTests(unittest.TestCase):
         )
         self.assert_rejected(rows, "no preceding successful CreateContainer")
 
-    def test_remove_before_stop(self):
+    def test_remove_unknown_container(self):
         rows = copy.deepcopy(self.rows)
         rows[8]["operation"] = "RemoveContainer"
-        self.assert_rejected(rows, "requires stopped container state")
+        rows[8]["container_id"] = "unknown-container"
+        self.assert_rejected(rows, "no preceding successful CreateContainer")
+
+    def test_remove_running_container_is_valid(self):
+        rows = copy.deepcopy(self.rows)
+        rows[10]["operation"] = "RemoveContainer"
+        del rows[12]
+        result = self.validate(rows, profile="core")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stop_sandbox_terminates_children(self):
+        rows = copy.deepcopy(self.rows)
+        stop = rows.pop(14)
+        stop["timestamp"] = "2026-01-01T00:00:10.5Z"
+        rows.insert(10, stop)
+        result = self.validate(rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_repeated_stop_sandbox_is_valid(self):
+        rows = copy.deepcopy(self.rows)
+        repeated = copy.deepcopy(rows[14])
+        repeated["timestamp"] = "2026-01-01T00:00:15.5Z"
+        rows.insert(15, repeated)
+        result = self.validate(rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_container_chain_without_successful_parent_run(self):
         rows = copy.deepcopy(self.rows)
@@ -88,7 +112,7 @@ class ValidatorTests(unittest.TestCase):
     def test_failed_transition_does_not_advance_state(self):
         rows = copy.deepcopy(self.rows)
         rows[8]["failed"] = True
-        self.assert_rejected(rows, "StopContainer requires started container state")
+        self.assert_rejected(rows, "StopContainer requires started or stopped container state")
 
 
 if __name__ == "__main__":

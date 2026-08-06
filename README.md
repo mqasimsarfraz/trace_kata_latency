@@ -164,13 +164,14 @@ The `kata` and `kata-preview` strings are CRI handler names. Record RuntimeClass
 
 ### Validator lifecycle policy
 
-The validator processes events in timestamp and file order. Successful calls
-must follow the normal CRI sequence `RunPodSandbox` → `CreateContainer` →
-`StartContainer` → `StopContainer` → `RemoveContainer` → `StopPodSandbox` →
-`RemovePodSandbox`. Sandbox teardown is rejected while a traced child remains.
-Failed calls are permitted only when their referenced object is in the state
-required by that operation; a failed call never advances or removes state, so
-a later retry is validated against the same prerequisite. A failed
-`RunPodSandbox` may have no returned sandbox ID because no identity was learned.
-The validator intentionally does not infer objects created before tracing
-started. Such partial streams fail and must be recaptured from sandbox creation.
+The validator processes events in timestamp and file order. It requires each
+container to follow an observed successful `RunPodSandbox` and
+`CreateContainer`, while preserving CRI teardown semantics:
+`StopPodSandbox` may terminate remaining containers, `RemoveContainer` may
+remove a running container, and stop/remove calls are idempotent. Failed calls
+are permitted only when their referenced object is known; a failed call never
+advances or removes state, so a later retry is validated against the same
+prerequisite. A failed `RunPodSandbox` may have no returned sandbox ID because
+no identity was learned. The validator intentionally does not infer objects
+created before tracing started. Such partial streams fail and must be recaptured
+from sandbox creation.

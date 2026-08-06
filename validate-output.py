@@ -117,12 +117,14 @@ def validate_lifecycle(rows):
             container = containers.get(container_key)
             require(container is not None, line_number, f"{operation} has no preceding successful CreateContainer")
             require(container["sandbox_id"] == sandbox_id, line_number, f"{operation} parent sandbox mismatch")
-            expected = {
-                "StartContainer": "created",
-                "StopContainer": "started",
-                "RemoveContainer": "stopped",
-            }[operation]
-            require(container["state"] == expected, line_number, f"{operation} requires {expected} container state")
+            if operation == "StartContainer":
+                require(container["state"] == "created", line_number, "StartContainer requires created container state")
+            elif operation == "StopContainer":
+                require(
+                    container["state"] in {"started", "stopped"},
+                    line_number,
+                    "StopContainer requires started or stopped container state",
+                )
             if not failed:
                 if operation == "StartContainer":
                     container["state"] = "started"
@@ -134,18 +136,24 @@ def validate_lifecycle(rows):
 
         require(bool(sandbox_id), line_number, f"{operation} is missing sandbox_id")
         require(not container_id, line_number, f"{operation} must not carry container_id")
-        expected = "running" if operation == "StopPodSandbox" else "stopped"
-        require(sandboxes.get(sandbox_key) == expected, line_number, f"{operation} requires {expected} sandbox state")
-        active_children = [
-            key for key, container in containers.items()
-            if key[0] == handler and container["sandbox_id"] == sandbox_id
-        ]
-        require(not active_children, line_number, f"{operation} precedes child container removal")
+        require(
+            sandboxes.get(sandbox_key) in {"running", "stopped"},
+            line_number,
+            f"{operation} has no preceding successful RunPodSandbox",
+        )
         if not failed:
             if operation == "StopPodSandbox":
                 sandboxes[sandbox_key] = "stopped"
+                for key, container in containers.items():
+                    if key[0] == handler and container["sandbox_id"] == sandbox_id:
+                        container["state"] = "stopped"
             else:
                 del sandboxes[sandbox_key]
+                for key in [
+                    key for key, container in containers.items()
+                    if key[0] == handler and container["sandbox_id"] == sandbox_id
+                ]:
+                    del containers[key]
 
 
 def main():
