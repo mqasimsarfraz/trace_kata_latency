@@ -1,5 +1,5 @@
 name: trace_kata_latency
-description: Trace kubelet CRI pod sandbox latency for Kata Containers
+description: Trace kubelet CRI sandbox and container latency for Kata Containers
 homepageURL: https://github.com/mqasimsarfraz/trace_container_latency
 sourceURL: https://github.com/mqasimsarfraz/trace_container_latency
 datasources:
@@ -29,12 +29,16 @@ datasources:
           columns.hidden: "true"
       operation_raw:
         annotations:
-          description: Raw pod sandbox lifecycle operation
+          description: Raw CRI lifecycle operation
           columns.hidden: "true"
       operation:
         annotations:
-          description: Pod sandbox lifecycle operation
+          description: CRI lifecycle operation
           columns.width: 20
+      runtime_handler:
+        annotations:
+          description: Kata CRI runtime handler
+          columns.width: 18
       latency_ns_raw:
         annotations:
           description: Kubelet CRI request-to-response latency
@@ -46,4 +50,8 @@ datasources:
       sandbox_id:
         annotations:
           description: CRI pod sandbox ID
+          columns.width: 32
+      container_id:
+        annotations:
+          description: CRI container ID
           columns.width: 32

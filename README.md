@@ -1,16 +1,23 @@
 # trace_kata_latency
 
-Minimal Inspektor Gadget gadget that prints Kata Containers pod sandbox
-request-to-response latency at the kubelet CRI boundary.
+Minimal Inspektor Gadget gadget that prints Kata Containers sandbox and
+container request-to-response latency at the kubelet CRI boundary.
 
 > Note: This gadget requires the `ig` image with stripped Go `.gopclntab` symbol resolution. See [ig](https://github.com/inspektor-gadget/inspektor-gadget/pull/5493/changes/ab03ef37ae901638ba8dfb69724991276487187e) for details.
 
 The gadget traces:
 
-- Kata `RunPodSandbox` requests using the `kata` runtime handler,
+- Kata `RunPodSandbox` requests using the `kata` or `kata-preview` runtime
+  handler,
   including creation and startup of the Kata VM.
 - `StopPodSandbox` for Kata sandbox IDs observed by the gadget.
 - `RemovePodSandbox` for Kata sandbox IDs observed by the gadget.
+- `CreateContainer`, `StartContainer`, `StopContainer`, and `RemoveContainer`
+  for containers belonging to those observed Kata sandboxes.
+
+Events from both handlers are emitted into the same timestamped stream and
+include the runtime handler label, so workloads using both runtime classes can
+be traced concurrently.
 
 ## Requirements
 
@@ -40,6 +47,13 @@ make push \
   GADGET_BUILD_PARAMS=--update-metadata
 ```
 
+## Continuous integration
+
+GitHub Actions builds the gadget for pull requests. Pushes to `main` publish
+both `sha-<commit>` and `latest` tags to
+`ghcr.io/mqasimsarfraz/trace_kata_latency`. Tags matching `v*` publish both the
+commit tag and the matching release tag.
+
 ## Run on AKS
 
 ```bash
@@ -61,20 +75,29 @@ It uses:
 Example output:
 
 ```text
-FAILED   OPERATION       LATENCY_NS      SANDBOX_ID
-0        SANDBOX_RUN     1.314252181s    9c58a84...
-0        SANDBOX_STOP    149.73ms        9c58a84...
-0        SANDBOX_REMOVE  42.76ms         9c58a84...
+FAILED   OPERATION         RUNTIME_HANDLER   LATENCY_NS      SANDBOX_ID   CONTAINER_ID
+0        SANDBOX_RUN       kata              1.314252181s    9c58a84...
+0        CONTAINER_CREATE  kata              486.21ms        9c58a84...  7f31c20...
+0        CONTAINER_START   kata              231.48ms                     7f31c20...
+0        SANDBOX_RUN       kata-preview      998.42ms        25b76dd...
+0        CONTAINER_STOP    kata              18.32ms                      7f31c20...
+0        CONTAINER_REMOVE  kata              12.11ms                      7f31c20...
+0        SANDBOX_STOP      kata              149.73ms        9c58a84...
+0        SANDBOX_REMOVE    kata              42.76ms         9c58a84...
 ```
 
 ## Interpreting the output
 
 - `FAILED` is `0` when the CRI call succeeds and `1` when it returns an error.
-- `OPERATION` identifies the CRI sandbox lifecycle call.
+- `OPERATION` identifies the CRI sandbox or container lifecycle call.
+- `RUNTIME_HANDLER` identifies the `kata` or `kata-preview` handler.
 - `LATENCY_NS` is the request-to-response duration, rendered in a
   human-readable unit by `ig`.
 - `SANDBOX_ID` is the ID returned by a successful `RunPodSandbox` call or
-  supplied to a later stop or remove call.
+  supplied to a later sandbox call. `CONTAINER_CREATE` includes its parent
+  sandbox ID.
+- `CONTAINER_ID` is the ID returned by a successful `CreateContainer` call or
+  supplied to a later container call.
 
 A failed `SANDBOX_RUN` normally has an empty `SANDBOX_ID` because the runtime
 did not return a usable sandbox. Repeated failed runs commonly indicate that
@@ -95,17 +118,18 @@ which typically includes starting the Kata runtime shim, hypervisor, guest VM,
 and guest agent. The exact work depends on the Kata, containerd, and platform
 configuration.
 
-The measurement does not include work performed after `RunPodSandbox`
-returns, such as image pulls, `CreateContainer`, `StartContainer`, or
-application readiness. It also does not include scheduler queueing before
-kubelet starts the CRI request.
+Each event measures one CRI call. Image pulls and application readiness remain
+outside these boundaries, as does scheduler queueing before kubelet starts the
+CRI request.
 
-The gadget classifies successful `RunPodSandbox` calls by their `kata` runtime
-handler (selected by the `kata-vm-isolation` RuntimeClass) and remembers the
-returned sandbox ID.
-Later stop and remove calls are emitted only when their ID belongs to a
-remembered Kata sandbox. Sandboxes created before the gadget starts are not
-known, so their stop and remove calls are not emitted.
+The gadget classifies `RunPodSandbox` calls by their `kata` or `kata-preview`
+runtime handler and remembers the returned sandbox ID. It uses the parent
+sandbox ID to classify `CreateContainer`, then remembers the returned container
+ID for subsequent start, stop, and remove calls.
+
+Later lifecycle calls are emitted only when their IDs belong to sandboxes or
+containers observed by the gadget. Resources created before the gadget starts
+are not known, so their later lifecycle calls are not emitted.
 
 ## Runtime warnings
 

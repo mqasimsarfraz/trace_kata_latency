@@ -16,25 +16,43 @@
 #define RUN_POD_SANDBOX_METHOD "/runtime.v1.RuntimeService/RunPodSandbox"
 #define STOP_POD_SANDBOX_METHOD "/runtime.v1.RuntimeService/StopPodSandbox"
 #define REMOVE_POD_SANDBOX_METHOD "/runtime.v1.RuntimeService/RemovePodSandbox"
+#define CREATE_CONTAINER_METHOD "/runtime.v1.RuntimeService/CreateContainer"
+#define START_CONTAINER_METHOD "/runtime.v1.RuntimeService/StartContainer"
+#define STOP_CONTAINER_METHOD "/runtime.v1.RuntimeService/StopContainer"
+#define REMOVE_CONTAINER_METHOD "/runtime.v1.RuntimeService/RemoveContainer"
 #define KATA_RUNTIME_HANDLER "kata"
+#define KATA_PREVIEW_RUNTIME_HANDLER "kata-preview"
 #define MAX_CRI_METHOD_LEN (sizeof(REMOVE_POD_SANDBOX_METHOD) - 1)
 #define MAX_SANDBOX_ID_LEN 128
+#define MAX_CONTAINER_ID_LEN 128
 #define MAX_INFLIGHT_RPCS 1024
 #define MAX_KATA_SANDBOXES 4096
+#define MAX_KATA_CONTAINERS 8192
 
-enum gadget_sandbox_operation {
+enum gadget_cri_operation {
 	SANDBOX_RUN,
 	SANDBOX_STOP,
 	SANDBOX_REMOVE,
+	CONTAINER_CREATE,
+	CONTAINER_START,
+	CONTAINER_STOP,
+	CONTAINER_REMOVE,
+};
+
+enum gadget_kata_handler {
+	GADGET_KATA_HANDLER_KATA,
+	GADGET_KATA_HANDLER_PREVIEW,
 };
 
 struct event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_process proc;
 	gadget_duration latency_ns_raw;
-	enum gadget_sandbox_operation operation_raw;
+	enum gadget_cri_operation operation_raw;
 	__u8 failed;
+	char runtime_handler[sizeof(KATA_PREVIEW_RUNTIME_HANDLER)];
 	char sandbox_id[MAX_SANDBOX_ID_LEN];
+	char container_id[MAX_CONTAINER_ID_LEN];
 };
 
 struct gadget_go_string {
@@ -49,25 +67,32 @@ struct gadget_run_pod_sandbox_request {
 	struct gadget_go_string runtime_handler;
 };
 
-struct gadget_sandbox_id_message {
+struct gadget_id_message {
+	__u64 state;
+	struct gadget_go_string id;
+};
+
+struct gadget_create_container_request {
 	__u64 state;
 	struct gadget_go_string sandbox_id;
 };
 
-struct gadget_sandbox_id {
-	char value[MAX_SANDBOX_ID_LEN];
+struct gadget_cri_id {
+	char value[MAX_CONTAINER_ID_LEN];
 };
 
 struct gadget_rpc_state {
 	__u64 start_ns;
-	enum gadget_sandbox_operation operation;
+	enum gadget_cri_operation operation;
+	enum gadget_kata_handler handler;
 	const void *reply;
-	struct gadget_sandbox_id sandbox_id;
+	struct gadget_cri_id sandbox_id;
+	struct gadget_cri_id container_id;
 };
 
 struct gadget_rpc_scratch {
 	struct gadget_rpc_state state;
-	struct gadget_sandbox_id sandbox_id;
+	struct gadget_cri_id id;
 };
 
 GADGET_TRACER_MAP(events, 1024 * 64);
@@ -85,9 +110,17 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	// 4096 entries use about 512 KiB and cover the Kata sandboxes on one node.
 	__uint(max_entries, MAX_KATA_SANDBOXES);
-	__type(key, struct gadget_sandbox_id);
+	__type(key, struct gadget_cri_id);
 	__type(value, __u8);
 } gadget_kata_sandboxes SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	// 8192 entries use about 1 MiB and cover active Kata containers on one node.
+	__uint(max_entries, MAX_KATA_CONTAINERS);
+	__type(key, struct gadget_cri_id);
+	__type(value, __u8);
+} gadget_kata_containers SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -126,11 +159,31 @@ static __always_inline int gadget_get_sandbox_operation(const char *method_ptr,
 			     sizeof(REMOVE_POD_SANDBOX_METHOD) - 1) == 0)
 		return SANDBOX_REMOVE;
 
+	if (method_len == sizeof(CREATE_CONTAINER_METHOD) - 1 &&
+	    __builtin_memcmp(method, CREATE_CONTAINER_METHOD,
+			     sizeof(CREATE_CONTAINER_METHOD) - 1) == 0)
+		return CONTAINER_CREATE;
+
+	if (method_len == sizeof(START_CONTAINER_METHOD) - 1 &&
+	    __builtin_memcmp(method, START_CONTAINER_METHOD,
+			     sizeof(START_CONTAINER_METHOD) - 1) == 0)
+		return CONTAINER_START;
+
+	if (method_len == sizeof(STOP_CONTAINER_METHOD) - 1 &&
+	    __builtin_memcmp(method, STOP_CONTAINER_METHOD,
+			     sizeof(STOP_CONTAINER_METHOD) - 1) == 0)
+		return CONTAINER_STOP;
+
+	if (method_len == sizeof(REMOVE_CONTAINER_METHOD) - 1 &&
+	    __builtin_memcmp(method, REMOVE_CONTAINER_METHOD,
+			     sizeof(REMOVE_CONTAINER_METHOD) - 1) == 0)
+		return CONTAINER_REMOVE;
+
 	return -1;
 }
 
 static __always_inline int
-gadget_read_go_string(struct gadget_sandbox_id *dst,
+gadget_read_go_string(struct gadget_cri_id *dst,
 		      const struct gadget_go_string *src)
 {
 	__builtin_memset(dst, 0, sizeof(*dst));
@@ -149,36 +202,74 @@ gadget_read_go_string(struct gadget_sandbox_id *dst,
 }
 
 static __always_inline int
-gadget_is_kata_run_request(const void *request_ptr)
+gadget_get_kata_handler(const void *request_ptr)
 {
 	struct gadget_run_pod_sandbox_request request = {};
-	char runtime_handler[sizeof(KATA_RUNTIME_HANDLER)] = {};
+	char runtime_handler[sizeof(KATA_PREVIEW_RUNTIME_HANDLER)] = {};
 
 	if (bpf_probe_read_user(&request, sizeof(request), request_ptr))
-		return 0;
+		return -1;
 
-	if (request.runtime_handler.len != sizeof(KATA_RUNTIME_HANDLER) - 1)
-		return 0;
+	if (request.runtime_handler.len == sizeof(KATA_RUNTIME_HANDLER) - 1) {
+		if (bpf_probe_read_user(runtime_handler,
+					sizeof(KATA_RUNTIME_HANDLER) - 1,
+					request.runtime_handler.data))
+			return -1;
 
-	if (bpf_probe_read_user(runtime_handler,
-				sizeof(KATA_RUNTIME_HANDLER) - 1,
-				request.runtime_handler.data))
-		return 0;
+		if (__builtin_memcmp(runtime_handler, KATA_RUNTIME_HANDLER,
+				     sizeof(KATA_RUNTIME_HANDLER) - 1) == 0)
+			return GADGET_KATA_HANDLER_KATA;
+	}
 
-	return __builtin_memcmp(runtime_handler, KATA_RUNTIME_HANDLER,
-				sizeof(KATA_RUNTIME_HANDLER) - 1) == 0;
+	if (request.runtime_handler.len ==
+	    sizeof(KATA_PREVIEW_RUNTIME_HANDLER) - 1) {
+		if (bpf_probe_read_user(runtime_handler,
+					sizeof(KATA_PREVIEW_RUNTIME_HANDLER) - 1,
+					request.runtime_handler.data))
+			return -1;
+
+		if (__builtin_memcmp(runtime_handler,
+				     KATA_PREVIEW_RUNTIME_HANDLER,
+				     sizeof(KATA_PREVIEW_RUNTIME_HANDLER) - 1) == 0)
+			return GADGET_KATA_HANDLER_PREVIEW;
+	}
+
+	return -1;
 }
 
 static __always_inline int
-gadget_read_sandbox_id_message(struct gadget_sandbox_id *sandbox_id,
-			       const void *message_ptr)
+gadget_read_id_message(struct gadget_cri_id *id, const void *message_ptr)
 {
-	struct gadget_sandbox_id_message message = {};
+	struct gadget_id_message message = {};
 
 	if (bpf_probe_read_user(&message, sizeof(message), message_ptr))
 		return -1;
 
-	return gadget_read_go_string(sandbox_id, &message.sandbox_id);
+	return gadget_read_go_string(id, &message.id);
+}
+
+static __always_inline int
+gadget_read_create_container_request(struct gadget_cri_id *sandbox_id,
+				     const void *request_ptr)
+{
+	struct gadget_create_container_request request = {};
+
+	if (bpf_probe_read_user(&request, sizeof(request), request_ptr))
+		return -1;
+
+	return gadget_read_go_string(sandbox_id, &request.sandbox_id);
+}
+
+static __always_inline void
+gadget_set_runtime_handler(char *runtime_handler,
+			   enum gadget_kata_handler handler)
+{
+	if (handler == GADGET_KATA_HANDLER_PREVIEW)
+		__builtin_memcpy(runtime_handler, KATA_PREVIEW_RUNTIME_HANDLER,
+				 sizeof(KATA_PREVIEW_RUNTIME_HANDLER));
+	else
+		__builtin_memcpy(runtime_handler, KATA_RUNTIME_HANDLER,
+				 sizeof(KATA_RUNTIME_HANDLER));
 }
 
 // Invoke exposes the request and response pointers before the unary RPC starts.
@@ -191,9 +282,10 @@ int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 	int operation = gadget_get_sandbox_operation(method_ptr, method_len);
 	struct gadget_rpc_scratch *scratch;
 	struct gadget_rpc_state *state;
-	__u8 *known_sandbox;
+	__u8 *known_handler;
 	__u32 zero = 0;
 	__u64 goroutine;
+	int handler;
 
 	if (operation < 0)
 		return 0;
@@ -206,18 +298,41 @@ int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 	__builtin_memset(state, 0, sizeof(*state));
 
 	if (operation == SANDBOX_RUN) {
-		if (!gadget_is_kata_run_request(request_ptr))
+		handler = gadget_get_kata_handler(request_ptr);
+		if (handler < 0)
 			return 0;
+		state->handler = handler;
 		state->reply = GO_PARAM9(ctx);
-	} else {
-		if (gadget_read_sandbox_id_message(&state->sandbox_id,
-						   request_ptr))
+	} else if (operation == SANDBOX_STOP ||
+		   operation == SANDBOX_REMOVE) {
+		if (gadget_read_id_message(&state->sandbox_id, request_ptr))
 			return 0;
 
-		known_sandbox = bpf_map_lookup_elem(&gadget_kata_sandboxes,
+		known_handler = bpf_map_lookup_elem(&gadget_kata_sandboxes,
 						    &state->sandbox_id);
-		if (!known_sandbox)
+		if (!known_handler)
 			return 0;
+		state->handler = *known_handler;
+	} else if (operation == CONTAINER_CREATE) {
+		if (gadget_read_create_container_request(&state->sandbox_id,
+							 request_ptr))
+			return 0;
+
+		known_handler = bpf_map_lookup_elem(&gadget_kata_sandboxes,
+						    &state->sandbox_id);
+		if (!known_handler)
+			return 0;
+		state->handler = *known_handler;
+		state->reply = GO_PARAM9(ctx);
+	} else {
+		if (gadget_read_id_message(&state->container_id, request_ptr))
+			return 0;
+
+		known_handler = bpf_map_lookup_elem(&gadget_kata_containers,
+						    &state->container_id);
+		if (!known_handler)
+			return 0;
+		state->handler = *known_handler;
 	}
 
 	goroutine = (__u64)GOROUTINE_PTR(ctx);
@@ -241,9 +356,9 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	__u64 goroutine = (__u64)GOROUTINE_PTR(ctx);
 	struct gadget_rpc_state *state;
 	struct gadget_rpc_scratch *scratch;
-	struct gadget_sandbox_id *sandbox_id;
+	struct gadget_cri_id *response_id;
 	struct event *event;
-	__u8 kata_sandbox = 1;
+	__u8 handler;
 	__u32 zero = 0;
 	bool failed;
 	__u64 now;
@@ -256,26 +371,35 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	if (!scratch)
 		goto cleanup;
 
-	sandbox_id = &scratch->sandbox_id;
-	__builtin_memset(sandbox_id, 0, sizeof(*sandbox_id));
+	response_id = &scratch->id;
+	__builtin_memset(response_id, 0, sizeof(*response_id));
 
 	now = bpf_ktime_get_boot_ns();
 	failed = (__u64)GO_PARAM2(ctx) != 0;
+	handler = state->handler;
 
 	if (state->operation == SANDBOX_RUN && !failed) {
-		if (gadget_read_sandbox_id_message(sandbox_id, state->reply))
+		if (gadget_read_id_message(response_id, state->reply))
 			goto cleanup;
 
-		if (bpf_map_update_elem(&gadget_kata_sandboxes, sandbox_id,
-					&kata_sandbox, BPF_ANY))
+		if (bpf_map_update_elem(&gadget_kata_sandboxes, response_id,
+					&handler, BPF_ANY))
 			bpf_printk("kata latency: sandbox map is full");
-	} else {
-		__builtin_memcpy(sandbox_id, &state->sandbox_id,
-				 sizeof(*sandbox_id));
+	} else if (state->operation == CONTAINER_CREATE && !failed) {
+		if (gadget_read_id_message(response_id, state->reply))
+			goto cleanup;
+
+		if (bpf_map_update_elem(&gadget_kata_containers, response_id,
+					&handler, BPF_ANY))
+			bpf_printk("kata latency: container map is full");
 	}
 
 	if (state->operation == SANDBOX_REMOVE && !failed)
-		bpf_map_delete_elem(&gadget_kata_sandboxes, sandbox_id);
+		bpf_map_delete_elem(&gadget_kata_sandboxes, &state->sandbox_id);
+
+	if (state->operation == CONTAINER_REMOVE && !failed)
+		bpf_map_delete_elem(&gadget_kata_containers,
+				    &state->container_id);
 
 	event = gadget_reserve_buf(&events, sizeof(*event));
 	if (!event)
@@ -287,8 +411,18 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	event->latency_ns_raw = now - state->start_ns;
 	event->operation_raw = state->operation;
 	event->failed = failed;
-	__builtin_memcpy(event->sandbox_id, sandbox_id->value,
+	gadget_set_runtime_handler(event->runtime_handler, state->handler);
+	__builtin_memcpy(event->sandbox_id, state->sandbox_id.value,
 			 sizeof(event->sandbox_id));
+	if (state->operation == SANDBOX_RUN)
+		__builtin_memcpy(event->sandbox_id, response_id->value,
+				 sizeof(event->sandbox_id));
+
+	__builtin_memcpy(event->container_id, state->container_id.value,
+			 sizeof(event->container_id));
+	if (state->operation == CONTAINER_CREATE)
+		__builtin_memcpy(event->container_id, response_id->value,
+				 sizeof(event->container_id));
 
 	gadget_submit_buf(ctx, &events, event, sizeof(*event));
 

@@ -1,0 +1,72 @@
+name: Build and publish gadget
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: gadget-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IG_VERSION: v0.55.0
+  GADGET_NAME: trace_kata_latency
+  GADGET_REPOSITORY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Inspektor Gadget
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://github.com/inspektor-gadget/inspektor-gadget/releases/download/${IG_VERSION}/ig-linux-amd64-${IG_VERSION}.tar.gz" \
+            | sudo tar --extract --gzip --directory /usr/local/bin ig
+          ig version
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build gadget
+        env:
+          GADGET_TAG: sha-${{ github.sha }}
+        run: make build SUDO=
+
+      - name: Push commit image
+        if: github.event_name != 'pull_request'
+        env:
+          GADGET_TAG: sha-${{ github.sha }}
+        run: make push-existing SUDO=
+
+      - name: Push latest image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          ig image tag \
+            "${GADGET_REPOSITORY}/${GADGET_NAME}:sha-${GITHUB_SHA}" \
+            "${GADGET_REPOSITORY}/${GADGET_NAME}:latest"
+          ig image push "${GADGET_REPOSITORY}/${GADGET_NAME}:latest"
+
+      - name: Push release image
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ig image tag \
+            "${GADGET_REPOSITORY}/${GADGET_NAME}:sha-${GITHUB_SHA}" \
+            "${GADGET_REPOSITORY}/${GADGET_NAME}:${GITHUB_REF_NAME}"
+          ig image push "${GADGET_REPOSITORY}/${GADGET_NAME}:${GITHUB_REF_NAME}"
