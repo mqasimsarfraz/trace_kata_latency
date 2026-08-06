@@ -34,6 +34,7 @@ jobs:
           curl --fail --location --silent --show-error \
             "https://github.com/inspektor-gadget/inspektor-gadget/releases/download/${IG_VERSION}/ig-linux-amd64-${IG_VERSION}.tar.gz" \
             | sudo tar --extract --gzip --directory /usr/local/bin ig
+          sudo install --directory --owner="${USER}" --group="${USER}" /var/lib/ig
           ig version
 
       - name: Log in to GHCR

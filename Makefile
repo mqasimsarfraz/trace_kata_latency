@@ -9,6 +9,7 @@ BUILDER_IMAGE ?= ghcr.io/inspektor-gadget/gadget-builder:main
 DOCKER ?= docker
 IG ?= ig
 SUDO ?= sudo
+SUDO_ENV := $(if $(strip $(SUDO)),$(SUDO) -E)
 GADGET_BUILD_PARAMS ?=
 IG_FLAGS ?=
 
@@ -21,7 +22,7 @@ pull-builder-image:
 
 build: pull-builder-image
 	@echo "Building $(GADGET_IMAGE)"
-	$(SUDO) -E $(IG) image build \
+	$(SUDO_ENV) $(IG) image build \
 		--builder-image $(BUILDER_IMAGE) \
 		--builder-image-pull=never \
 		-t $(GADGET_IMAGE) \
@@ -30,8 +31,8 @@ build: pull-builder-image
 
 push: build
 	@echo "Pushing $(GADGET_IMAGE)"
-	$(SUDO) -E $(IG) image push $(GADGET_IMAGE) $(IG_FLAGS)
+	$(SUDO_ENV) $(IG) image push $(GADGET_IMAGE) $(IG_FLAGS)
 
 push-existing:
 	@echo "Pushing existing $(GADGET_IMAGE)"
-	$(SUDO) -E $(IG) image push $(GADGET_IMAGE) $(IG_FLAGS)
+	$(SUDO_ENV) $(IG) image push $(GADGET_IMAGE) $(IG_FLAGS)
