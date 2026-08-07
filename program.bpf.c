@@ -48,8 +48,8 @@ struct event {
 	gadget_timestamp timestamp_raw;
 	struct gadget_process proc;
 	gadget_duration latency_ns_raw;
-	enum gadget_cri_operation operation_raw;
-	__u8 failed;
+	bool failed;
+	char operation[20];
 	char runtime_handler[sizeof(KATA_PREVIEW_RUNTIME_HANDLER)];
 	char sandbox_id[MAX_SANDBOX_ID_LEN];
 	char container_id[MAX_CONTAINER_ID_LEN];
@@ -79,6 +79,11 @@ struct gadget_create_container_request {
 
 struct gadget_cri_id {
 	char value[MAX_CONTAINER_ID_LEN];
+};
+
+struct gadget_container_state {
+	struct gadget_cri_id sandbox_id;
+	enum gadget_kata_handler handler;
 };
 
 struct gadget_rpc_state {
@@ -116,10 +121,10 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	// 8192 entries use about 1 MiB and cover active Kata containers on one node.
+	// 8192 entries use about 2 MiB and cover active Kata containers on one node.
 	__uint(max_entries, MAX_KATA_CONTAINERS);
 	__type(key, struct gadget_cri_id);
-	__type(value, __u8);
+	__type(value, struct gadget_container_state);
 } gadget_kata_containers SEC(".maps");
 
 struct {
@@ -261,6 +266,34 @@ gadget_read_create_container_request(struct gadget_cri_id *sandbox_id,
 }
 
 static __always_inline void
+gadget_set_operation(char dst[20], enum gadget_cri_operation operation)
+{
+	switch (operation) {
+	case SANDBOX_RUN:
+		__builtin_memcpy(dst, "RunPodSandbox", sizeof("RunPodSandbox"));
+		break;
+	case SANDBOX_STOP:
+		__builtin_memcpy(dst, "StopPodSandbox", sizeof("StopPodSandbox"));
+		break;
+	case SANDBOX_REMOVE:
+		__builtin_memcpy(dst, "RemovePodSandbox", sizeof("RemovePodSandbox"));
+		break;
+	case CONTAINER_CREATE:
+		__builtin_memcpy(dst, "CreateContainer", sizeof("CreateContainer"));
+		break;
+	case CONTAINER_START:
+		__builtin_memcpy(dst, "StartContainer", sizeof("StartContainer"));
+		break;
+	case CONTAINER_STOP:
+		__builtin_memcpy(dst, "StopContainer", sizeof("StopContainer"));
+		break;
+	case CONTAINER_REMOVE:
+		__builtin_memcpy(dst, "RemoveContainer", sizeof("RemoveContainer"));
+		break;
+	}
+}
+
+static __always_inline void
 gadget_set_runtime_handler(char *runtime_handler,
 			   enum gadget_kata_handler handler)
 {
@@ -283,6 +316,7 @@ int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 	struct gadget_rpc_scratch *scratch;
 	struct gadget_rpc_state *state;
 	__u8 *known_handler;
+	struct gadget_container_state *known_container;
 	__u32 zero = 0;
 	__u64 goroutine;
 	int handler;
@@ -328,11 +362,13 @@ int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 		if (gadget_read_id_message(&state->container_id, request_ptr))
 			return 0;
 
-		known_handler = bpf_map_lookup_elem(&gadget_kata_containers,
-						    &state->container_id);
-		if (!known_handler)
+		known_container = bpf_map_lookup_elem(&gadget_kata_containers,
+						      &state->container_id);
+		if (!known_container)
 			return 0;
-		state->handler = *known_handler;
+		state->handler = known_container->handler;
+		__builtin_memcpy(&state->sandbox_id, &known_container->sandbox_id,
+				 sizeof(state->sandbox_id));
 	}
 
 	goroutine = (__u64)GOROUTINE_PTR(ctx);
@@ -359,6 +395,7 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	struct gadget_cri_id *response_id;
 	struct event *event;
 	__u8 handler;
+	struct gadget_container_state container_state = {};
 	__u32 zero = 0;
 	bool failed;
 	__u64 now;
@@ -389,8 +426,11 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 		if (gadget_read_id_message(response_id, state->reply))
 			goto cleanup;
 
+		__builtin_memcpy(&container_state.sandbox_id, &state->sandbox_id,
+				 sizeof(container_state.sandbox_id));
+		container_state.handler = handler;
 		if (bpf_map_update_elem(&gadget_kata_containers, response_id,
-					&handler, BPF_ANY))
+					&container_state, BPF_ANY))
 			bpf_printk("kata latency: container map is full");
 	}
 
@@ -409,8 +449,8 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	event->timestamp_raw = now;
 	gadget_process_populate(&event->proc);
 	event->latency_ns_raw = now - state->start_ns;
-	event->operation_raw = state->operation;
 	event->failed = failed;
+	gadget_set_operation(event->operation, state->operation);
 	gadget_set_runtime_handler(event->runtime_handler, state->handler);
 	__builtin_memcpy(event->sandbox_id, state->sandbox_id.value,
 			 sizeof(event->sandbox_id));

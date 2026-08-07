@@ -1,7 +1,7 @@
 name: trace_kata_latency
 description: Trace kubelet CRI sandbox and container latency for Kata Containers
-homepageURL: https://github.com/mqasimsarfraz/trace_container_latency
-sourceURL: https://github.com/mqasimsarfraz/trace_container_latency
+homepageURL: https://github.com/mqasimsarfraz/trace_kata_latency
+sourceURL: https://github.com/mqasimsarfraz/trace_kata_latency
 datasources:
   kata_latency:
     fields:
@@ -26,10 +26,6 @@ datasources:
           columns.hidden: "true"
       proc.parent.tid:
         annotations:
-          columns.hidden: "true"
-      operation_raw:
-        annotations:
-          description: Raw CRI lifecycle operation
           columns.hidden: "true"
       operation:
         annotations:
