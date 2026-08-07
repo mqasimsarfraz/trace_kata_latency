@@ -1,7 +1,7 @@
 # trace_kata_latency
 
-Minimal Inspektor Gadget gadget that prints Kata Containers sandbox and
-container request-to-response latency at the kubelet CRI boundary.
+Minimal Inspektor Gadget metrics gadget that aggregates Kata Containers sandbox
+and container request-to-response latency at the kubelet CRI boundary.
 
 > Note: This gadget requires the `ig` image with stripped Go `.gopclntab` symbol resolution. See [ig](https://github.com/inspektor-gadget/inspektor-gadget/pull/5493/changes/ab03ef37ae901638ba8dfb69724991276487187e) for details.
 
@@ -15,9 +15,28 @@ The gadget traces:
 - `CreateContainer`, `StartContainer`, `StopContainer`, and `RemoveContainer`
   for containers belonging to those observed Kata sandboxes.
 
-Events from both handlers are emitted into the same timestamped stream and
-include the runtime handler label, so workloads using both runtime classes can
-be traced concurrently.
+Metrics are grouped by CRI operation and runtime handler:
+
+- A base-2 latency histogram suitable for percentile calculations.
+- Successful request count through the histogram's `_count` metric.
+
+Failed CRI calls are excluded because retry and timeout behavior can skew the
+latency distribution away from successful operation performance.
+
+The gadget does not print a histogram until it observes a successful matching
+CRI call after startup. Existing sandboxes and containers are not backfilled.
+
+Run without `-o json` to use IG's histogram renderer:
+
+```bash
+ig-custom run \
+  --verify-image=false \
+  ghcr.io/mqasimsarfraz/trace_kata_latency:latency-metrics
+```
+
+The CLI histogram renderer currently does not display the `operation` and
+`runtime_handler` labels. Use the Prometheus endpoint for correctly labelled
+per-operation and per-handler histograms.
 
 ## Requirements
 
@@ -47,6 +66,36 @@ make push \
   GADGET_BUILD_PARAMS=--update-metadata
 ```
 
+## Export latency metrics
+
+The `kata_latency_metrics` map iterator is collected as an OpenTelemetry metric
+data source. Enable the Prometheus endpoint and assign the data source a unique
+metric name when running the gadget:
+
+```bash
+sudo ig run \
+  --otel-metrics-listen=true \
+  --otel-metrics-name=kata_latency_metrics \
+  ghcr.io/mqasimsarfraz/trace_kata_latency:latest
+```
+
+The Prometheus-compatible endpoint is available at
+`http://127.0.0.1:2224/metrics` by default.
+
+For example, calculate the five-minute p95 latency in seconds with:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, operation, runtime_handler) (
+    rate(kata_latency_metrics_latency_us_bucket[5m])
+  )
+) / 1000000
+```
+
+Use `0.90` for p90. Histogram percentiles are estimates whose precision depends
+on the base-2 bucket boundaries.
+
 ## Continuous integration
 
 GitHub Actions builds the gadget for pull requests. Pushes to `main` publish
@@ -72,39 +121,6 @@ It uses:
 - `ghcr.io/mqasimsarfraz/ig:go-uprobe-symbol`
 - `ghcr.io/mqasimsarfraz/trace_kata_latency:latest`
 
-Example output:
-
-```text
-FAILED   OPERATION         RUNTIME_HANDLER   LATENCY_NS      SANDBOX_ID   CONTAINER_ID
-0        SANDBOX_RUN       kata              1.314252181s    9c58a84...
-0        CONTAINER_CREATE  kata              486.21ms        9c58a84...  7f31c20...
-0        CONTAINER_START   kata              231.48ms                     7f31c20...
-0        SANDBOX_RUN       kata-preview      998.42ms        25b76dd...
-0        CONTAINER_STOP    kata              18.32ms                      7f31c20...
-0        CONTAINER_REMOVE  kata              12.11ms                      7f31c20...
-0        SANDBOX_STOP      kata              149.73ms        9c58a84...
-0        SANDBOX_REMOVE    kata              42.76ms         9c58a84...
-```
-
-## Interpreting the output
-
-- `FAILED` is `0` when the CRI call succeeds and `1` when it returns an error.
-- `OPERATION` identifies the CRI sandbox or container lifecycle call.
-- `RUNTIME_HANDLER` identifies the `kata` or `kata-preview` handler.
-- `LATENCY_NS` is the request-to-response duration, rendered in a
-  human-readable unit by `ig`.
-- `SANDBOX_ID` is the ID returned by a successful `RunPodSandbox` call or
-  supplied to a later sandbox call. `CONTAINER_CREATE` includes its parent
-  sandbox ID.
-- `CONTAINER_ID` is the ID returned by a successful `CreateContainer` call or
-  supplied to a later container call.
-
-A failed `SANDBOX_RUN` normally has an empty `SANDBOX_ID` because the runtime
-did not return a usable sandbox. Repeated failed runs commonly indicate that
-kubelet is retrying sandbox creation for the same Pod. The gadget records only
-whether the call failed, not the error message; use `kubectl describe pod`,
-Kubernetes events, and kubelet or containerd logs to find the cause.
-
 ## `RunPodSandbox` semantics and latency boundary
 
 The CRI defines `RunPodSandbox` as a unary gRPC request and requires the
@@ -118,18 +134,18 @@ which typically includes starting the Kata runtime shim, hypervisor, guest VM,
 and guest agent. The exact work depends on the Kata, containerd, and platform
 configuration.
 
-Each event measures one CRI call. Image pulls and application readiness remain
-outside these boundaries, as does scheduler queueing before kubelet starts the
-CRI request.
+Each histogram observation measures one CRI call. Image pulls and application
+readiness remain outside these boundaries, as does scheduler queueing before
+kubelet starts the CRI request.
 
 The gadget classifies `RunPodSandbox` calls by their `kata` or `kata-preview`
 runtime handler and remembers the returned sandbox ID. It uses the parent
 sandbox ID to classify `CreateContainer`, then remembers the returned container
 ID for subsequent start, stop, and remove calls.
 
-Later lifecycle calls are emitted only when their IDs belong to sandboxes or
+Later lifecycle calls are counted only when their IDs belong to sandboxes or
 containers observed by the gadget. Resources created before the gadget starts
-are not known, so their later lifecycle calls are not emitted.
+are not known, so their later lifecycle calls are not counted.
 
 ## Runtime warnings
 

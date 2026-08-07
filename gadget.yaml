@@ -3,55 +3,21 @@ description: Trace kubelet CRI sandbox and container latency for Kata Containers
 homepageURL: https://github.com/mqasimsarfraz/trace_container_latency
 sourceURL: https://github.com/mqasimsarfraz/trace_container_latency
 datasources:
-  kata_latency:
+  kata_latency_metrics:
+    annotations:
+      metrics.collect: "true"
+      metrics.print: "true"
+      cli.clear-screen-before: "true"
     fields:
-      timestamp_raw:
-        annotations:
-          template: timestamp
-      runtime.containerName:
-        annotations:
-          columns.hidden: "true"
-      proc:
-        annotations:
-          columns.hidden: "true"
-          json.skip: "true"
-      proc.comm:
-        annotations:
-          columns.hidden: "true"
-      proc.pid:
-        annotations:
-          columns.hidden: "true"
-      proc.tid:
-        annotations:
-          columns.hidden: "true"
-      proc.parent.tid:
-        annotations:
-          columns.hidden: "true"
-      operation_raw:
-        annotations:
-          description: Raw CRI lifecycle operation
-          columns.hidden: "true"
       operation:
         annotations:
           description: CRI lifecycle operation
-          columns.width: 20
+          metrics.type: key
       runtime_handler:
         annotations:
           description: Kata CRI runtime handler
-          columns.width: 18
-      latency_ns_raw:
+          metrics.type: key
+      latency_us:
         annotations:
-          description: Kubelet CRI request-to-response latency
-          columns.width: 12
-      failed:
-        annotations:
-          description: Whether the CRI call completed with an error
-          columns.width: 8
-      sandbox_id:
-        annotations:
-          description: CRI pod sandbox ID
-          columns.width: 32
-      container_id:
-        annotations:
-          description: CRI container ID
-          columns.width: 32
+          metrics.description: CRI operation latency distribution
+          metrics.unit: µs

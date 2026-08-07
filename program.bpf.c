@@ -6,9 +6,10 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#include <gadget/buffer.h>
-#include <gadget/common.h>
+#include <gadget/bits.bpf.h>
+#include <gadget/filter.h>
 #include <gadget/macros.h>
+#include <gadget/maps.bpf.h>
 #include <gadget/types.h>
 
 #include "go-utils.h"
@@ -28,6 +29,8 @@
 #define MAX_INFLIGHT_RPCS 1024
 #define MAX_KATA_SANDBOXES 4096
 #define MAX_KATA_CONTAINERS 8192
+#define LATENCY_HISTOGRAM_SLOTS 32
+#define MAX_LATENCY_METRIC_KEYS (7 * 2)
 
 enum gadget_cri_operation {
 	SANDBOX_RUN,
@@ -42,17 +45,6 @@ enum gadget_cri_operation {
 enum gadget_kata_handler {
 	GADGET_KATA_HANDLER_KATA,
 	GADGET_KATA_HANDLER_PREVIEW,
-};
-
-struct event {
-	gadget_timestamp timestamp_raw;
-	struct gadget_process proc;
-	gadget_duration latency_ns_raw;
-	enum gadget_cri_operation operation_raw;
-	__u8 failed;
-	char runtime_handler[sizeof(KATA_PREVIEW_RUNTIME_HANDLER)];
-	char sandbox_id[MAX_SANDBOX_ID_LEN];
-	char container_id[MAX_CONTAINER_ID_LEN];
 };
 
 struct gadget_go_string {
@@ -95,8 +87,14 @@ struct gadget_rpc_scratch {
 	struct gadget_cri_id id;
 };
 
-GADGET_TRACER_MAP(events, 1024 * 64);
-GADGET_TRACER(kata_latency, events, event);
+struct gadget_latency_key {
+	char operation[sizeof("CONTAINER_REMOVE")];
+	char runtime_handler[sizeof(KATA_PREVIEW_RUNTIME_HANDLER)];
+};
+
+struct gadget_latency_value {
+	gadget_histogram_slot__u64 latency_us[LATENCY_HISTOGRAM_SLOTS];
+};
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -128,6 +126,18 @@ struct {
 	__type(key, __u32);
 	__type(value, struct gadget_rpc_scratch);
 } gadget_rpc_scratch SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	// Seven operations and two handlers produce 14 stable metric series.
+	__uint(max_entries, MAX_LATENCY_METRIC_KEYS);
+	__type(key, struct gadget_latency_key);
+	__type(value, struct gadget_latency_value);
+} gadget_latency_metrics SEC(".maps");
+
+GADGET_MAPITER(kata_latency_metrics, gadget_latency_metrics);
+
+static struct gadget_latency_value gadget_empty_latency_metrics;
 
 static __always_inline int gadget_get_sandbox_operation(const char *method_ptr,
 							 __u64 method_len)
@@ -272,6 +282,63 @@ gadget_set_runtime_handler(char *runtime_handler,
 				 sizeof(KATA_RUNTIME_HANDLER));
 }
 
+static __always_inline void
+gadget_set_operation(char *operation, enum gadget_cri_operation value)
+{
+	switch (value) {
+	case SANDBOX_RUN:
+		__builtin_memcpy(operation, "SANDBOX_RUN", sizeof("SANDBOX_RUN"));
+		break;
+	case SANDBOX_STOP:
+		__builtin_memcpy(operation, "SANDBOX_STOP",
+				 sizeof("SANDBOX_STOP"));
+		break;
+	case SANDBOX_REMOVE:
+		__builtin_memcpy(operation, "SANDBOX_REMOVE",
+				 sizeof("SANDBOX_REMOVE"));
+		break;
+	case CONTAINER_CREATE:
+		__builtin_memcpy(operation, "CONTAINER_CREATE",
+				 sizeof("CONTAINER_CREATE"));
+		break;
+	case CONTAINER_START:
+		__builtin_memcpy(operation, "CONTAINER_START",
+				 sizeof("CONTAINER_START"));
+		break;
+	case CONTAINER_STOP:
+		__builtin_memcpy(operation, "CONTAINER_STOP",
+				 sizeof("CONTAINER_STOP"));
+		break;
+	case CONTAINER_REMOVE:
+		__builtin_memcpy(operation, "CONTAINER_REMOVE",
+				 sizeof("CONTAINER_REMOVE"));
+		break;
+	}
+}
+
+static __always_inline void
+gadget_record_latency(const struct gadget_rpc_state *state, __u64 latency_ns)
+{
+	struct gadget_latency_key key = {};
+	struct gadget_latency_value *metrics;
+	__u64 latency_us = latency_ns / 1000;
+	__u64 slot;
+
+	gadget_set_operation(key.operation, state->operation);
+	gadget_set_runtime_handler(key.runtime_handler, state->handler);
+
+	metrics = bpf_map_lookup_or_try_init(&gadget_latency_metrics, &key,
+					     &gadget_empty_latency_metrics);
+	if (!metrics)
+		return;
+
+	slot = get_slot_idx(latency_us);
+	if (slot >= LATENCY_HISTOGRAM_SLOTS)
+		slot = LATENCY_HISTOGRAM_SLOTS - 1;
+
+	__sync_fetch_and_add(&metrics->latency_us[slot], 1);
+}
+
 // Invoke exposes the request and response pointers before the unary RPC starts.
 SEC("uprobe//opt/bin/kubelet:google.golang.org/grpc.(*ClientConn).Invoke")
 int gadget_trace_container_rpc_start(struct pt_regs *ctx)
@@ -286,6 +353,9 @@ int gadget_trace_container_rpc_start(struct pt_regs *ctx)
 	__u32 zero = 0;
 	__u64 goroutine;
 	int handler;
+
+	if (gadget_should_discard_data_current())
+		return 0;
 
 	if (operation < 0)
 		return 0;
@@ -357,7 +427,6 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 	struct gadget_rpc_state *state;
 	struct gadget_rpc_scratch *scratch;
 	struct gadget_cri_id *response_id;
-	struct event *event;
 	__u8 handler;
 	__u32 zero = 0;
 	bool failed;
@@ -401,30 +470,8 @@ int gadget_trace_container_rpc_finish(struct pt_regs *ctx)
 		bpf_map_delete_elem(&gadget_kata_containers,
 				    &state->container_id);
 
-	event = gadget_reserve_buf(&events, sizeof(*event));
-	if (!event)
-		goto cleanup;
-
-	__builtin_memset(event, 0, sizeof(*event));
-	event->timestamp_raw = now;
-	gadget_process_populate(&event->proc);
-	event->latency_ns_raw = now - state->start_ns;
-	event->operation_raw = state->operation;
-	event->failed = failed;
-	gadget_set_runtime_handler(event->runtime_handler, state->handler);
-	__builtin_memcpy(event->sandbox_id, state->sandbox_id.value,
-			 sizeof(event->sandbox_id));
-	if (state->operation == SANDBOX_RUN)
-		__builtin_memcpy(event->sandbox_id, response_id->value,
-				 sizeof(event->sandbox_id));
-
-	__builtin_memcpy(event->container_id, state->container_id.value,
-			 sizeof(event->container_id));
-	if (state->operation == CONTAINER_CREATE)
-		__builtin_memcpy(event->container_id, response_id->value,
-				 sizeof(event->container_id));
-
-	gadget_submit_buf(ctx, &events, event, sizeof(*event));
+	if (!failed)
+		gadget_record_latency(state, now - state->start_ns);
 
 cleanup:
 	bpf_map_delete_elem(&gadget_inflight_rpcs, &goroutine);
